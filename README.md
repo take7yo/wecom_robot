@@ -53,9 +53,10 @@
 
 ### 多机器人处理
 
-现在我们有很多的机器人，即有很多的 key，直接传入有点麻烦，让我们再写一个脚本，用 json 定义各个 `YOUR_WEBHOOK_KEY` 信息，维护在脚本里，然后用 `./wecom_robot.sh [json 定义的 key]` 替换 `./send_message.sh -k "YOUR_WEBHOOK_KEY"` 部分调用。
+现在我们有很多的机器人，即有很多的 key，直接使用 `./send_message.sh -k [key]` 有点麻烦，让我们再写一个脚本，用 **json** 定义各个 `YOUR_WEBHOOK_KEY` 信息，维护在文件里，然后用 `./wecom_robot.sh [json 定义的 key]` 替换 `./send_message.sh -k "YOUR_WEBHOOK_KEY"` 部分调用。
 
-同时，在指定的 `key` 不存在时，不传递 `-k` 参数给 `send_message.sh`，从而使用 `send_message.sh` 中默认定义的 `YOUR_WEBHOOK_KEY`。
+- 指定的 `key` 不存在时，不传递 `-k` 参数给 `send_message.sh`，从而使用 `send_message.sh` 中默认定义的 `YOUR_WEBHOOK_KEY`。
+- 指定多个 `key` 同时给多个机器人发送相同消息，如果指定的 `key` 对应机器人不存在，则不发送消息，并输出相应报错信息。
 
 **使用步骤如下：**
 
@@ -77,17 +78,23 @@
 3. 使用 `wecom_robot.sh` 来发送消息。
 
    - **发送给所有 key：**
-   ```shell
-   ./wecom_robot.sh --all text "大家好，我是机器人，现在在测试" "user1,user2" "13800000000,13900000000"
-   ```
+     ```shell
+     ./wecom_robot.sh --all text "大家好，我是机器人，现在在测试" "user1,user2" "13800000000,13900000000"
+     ```
+
+   - **发送消息给特定的多个 keys（用逗号分隔）：**
+     ```bash
+     ./wecom_robot.sh key1,key2 text "大家好，我是机器人，现在在测试" "user1,user2" "13800000000,13900000000"
+     ```
+     如果多个 key 存在不可用的 key，则不发送消息，并输出异常 key 信息。
 
    - **使用单个 key：**
-   ```shell
-   ./wecom_robot.sh key1 text "大家好，我是机器人，现在在测试" "user1,user2" "13800000000,13900000000"
-   ```
+     ```shell
+     ./wecom_robot.sh key1 text "大家好，我是机器人，现在在测试" "user1,user2" "13800000000,13900000000"
+     ```
 
    - **如果 `keys.json` 文件不存在或指定的 key 不存在，则会自动使用 `send_message.sh` 中的默认 `YOUR_WEBHOOK_KEY`：**
-   ```shell
-   ./wecom_robot.sh nonexistent_key text "大家好，我是机器人，现在在测试" "user1,user2" "13800000000,13900000000"
-   ```
-   这样，当指定的 key 不存在时，脚本会输出中文提示信息，并使用默认的 `YOUR_WEBHOOK_KEY`。
+     ```shell
+     ./wecom_robot.sh nonexistent_key text "大家好，我是机器人，现在在测试" "user1,user2" "13800000000,13900000000"
+     ```
+     这样，当指定的 key 不存在时，脚本会输出中文提示信息，并使用默认的 `YOUR_WEBHOOK_KEY`。
