@@ -26,6 +26,11 @@
 #
 # 作者: Ivan Zhang
 # 日期: 2024/07/26
+#
+# 更新日志：
+#
+# 2026/06/01
+#   1. 优化读写缓存处理，修复同名文件修改后使用缓存文件问题
 
 DEFAULT_KEY="[replace by your default key]"
 CACHE_FILE=".media_cache"
@@ -39,35 +44,75 @@ read_cache() {
 
 # 写入缓存文件
 write_cache() {
-    local file_hash="$1"
-    local media_id="$2"
-    local expiry_time="$3"
-    echo "$file_hash $media_id $expiry_time" >> "$CACHE_FILE"
+    local file_path="$1"
+    local file_hash="$2"
+    local media_id="$3"
+    local expiry_time="$4"
+    local file_mtime=$(stat -c %Y "$file_path" 2>/dev/null || echo "0")
+    local updated=false
+    local temp_records=()
+
+    # 读取现有缓存
+    if [ -f "$CACHE_FILE" ]; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            
+            cached_file_hash=$(echo "$line" | awk '{print $1}')
+            
+            # 如果找到相同文件哈希，更新记录
+            if [ "$file_hash" == "$cached_file_hash" ]; then
+                temp_records+=("$file_hash $media_id $expiry_time $file_mtime")
+                updated=true
+            else
+                temp_records+=("$line")
+            fi
+        done < "$CACHE_FILE"
+    fi
+    
+    # 如果没有找到相同文件哈希，添加新记录
+    if [ "$updated" = false ]; then
+        temp_records+=("$file_hash $media_id $expiry_time $file_mtime")
+    fi
+    
+    # 写入缓存文件
+    printf "%s\n" "${temp_records[@]}" > "$CACHE_FILE.tmp" 2>/dev/null
+    [ -f "$CACHE_FILE.tmp" ] && mv "$CACHE_FILE.tmp" "$CACHE_FILE" 2>/dev/null
 }
 
 # 检查文件是否已存在且未过期
 check_cache() {
-    local file_hash="$1"
+    local file_path="$1"
+    local file_hash="$2"
     local current_time=$(date +%s)
     local valid_records=()
     local cached_media_id=""
+    
+    # 获取文件的最后修改时间
+    local file_mtime=$(stat -c %Y "$file_path" 2>/dev/null || echo "0")
 
     if [ -f "$CACHE_FILE" ]; then
-        while read -r line; do
+        # 先读取整个文件
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            
             cached_file_hash=$(echo "$line" | awk '{print $1}')
-            cached_media_id=$(echo "$line" | awk '{print $2}')
+            cached_media_id_val=$(echo "$line" | awk '{print $2}')
             cached_expiry_time=$(echo "$line" | awk '{print $3}')
+            cached_file_mtime=$(echo "$line" | awk '{print $4}')
 
             if [ "$current_time" -lt "$cached_expiry_time" ]; then
-                valid_records+=("$line")
-                if [ "$file_hash" == "$cached_file_hash" ]; then
-                    cached_media_id="$cached_media_id"
+                # 检查是否匹配当前文件
+                if [ "$file_hash" == "$cached_file_hash" ] && [ "$file_mtime" == "$cached_file_mtime" ]; then
+                    cached_media_id="$cached_media_id_val"
                 fi
+                # 保留未过期的记录
+                valid_records+=("$line")
             fi
         done < "$CACHE_FILE"
 
         # 更新缓存文件
-        printf "%s\n" "${valid_records[@]}" > "$CACHE_FILE"
+        printf "%s\n" "${valid_records[@]}" > "$CACHE_FILE.tmp" 2>/dev/null
+        [ -f "$CACHE_FILE.tmp" ] && mv "$CACHE_FILE.tmp" "$CACHE_FILE" 2>/dev/null
 
         if [ -n "$cached_media_id" ]; then
             echo "$cached_media_id"
@@ -257,10 +302,12 @@ upload_file() {
                 return 1
             fi
             # 检查播放长度是否超过 60s
-            local duration=$(sox --i -D "$file_path")
-            if (( $(echo "$duration > 60" | bc -l) )); then
-                echo "错误: 语音文件播放长度不能超过 60 秒。"
-                return 1
+            if command -v sox >/dev/null 2>&1; then
+                local duration=$(sox --i -D "$file_path" 2>/dev/null || echo 0)
+                if (( $(echo "$duration > 60" | bc -l 2>/dev/null) )); then
+                    echo "错误: 语音文件播放长度不能超过 60 秒。"
+                    return 1
+                fi
             fi
             ;;
         *)
