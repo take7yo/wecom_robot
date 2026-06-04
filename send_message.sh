@@ -1,4 +1,5 @@
 #!/bin/bash
+# -*- coding: utf-8 -*-
 
 # Shell 脚本用于发送不同类型的消息到企业微信的 Webhook 接口
 # 支持发送文本消息、Markdown 格式消息、新闻格式消息、文件消息、语音消息和图片消息
@@ -31,26 +32,161 @@
 #
 # 2026/06/01
 #   1. 优化读写缓存处理，修复同名文件修改后使用缓存文件问题
+# 2026/06/04
+#   1. 增强缓存功能，改进哈希计算逻辑
+#   2. 添加依赖检查机制
+#   3. 引入缓存文件锁机制防止并发访问冲突
+#   4. 设置缓存文件安全权限（600）
+#   5. 优化锁管理，确保异常情况下的锁清理
+#   6. 清理代码，删除未使用的 read_cache 函数
+#   7. 重构 check_cache 函数，避免潜在死锁风险
 
 DEFAULT_KEY="[replace by your default key]"
 CACHE_FILE=".media_cache"
+LOCK_FILE="/tmp/wechat_webhook_cache_$(id -u).lock"
 
-# 读取缓存文件
-read_cache() {
-    if [ -f "$CACHE_FILE" ]; then
-        cat "$CACHE_FILE"
+# 获取文件锁
+#   原理: 使用一个临时文件作为锁标志，尝试创建该文件来获取锁，如果文件已存在则说明锁被占用。
+acquire_lock() {
+    local timeout=10
+    local lock_acquired=false
+    local lock_pid
+    
+    for ((i=0; i<timeout; i++)); do
+        if ( set -o noclobber; echo "$$" > "$LOCK_FILE" ) 2>/dev/null; then
+            lock_acquired=true
+            # 设置信号处理，确保在脚本退出时清理锁文件
+            trap 'rm -f "$LOCK_FILE" 2>/dev/null' EXIT INT TERM
+            break
+        fi
+        
+        # 检查锁是否被僵尸进程占用
+        if [ -f "$LOCK_FILE" ]; then
+            lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
+            if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+                # 进程不存在，清理僵尸锁
+                rm -f "$LOCK_FILE" 2>/dev/null
+            fi
+        fi
+        
+        sleep 0.1
+    done
+    
+    if [ "$lock_acquired" = false ]; then
+        echo "警告: 无法获取文件锁，跳过缓存操作" >&2
+        return 1
     fi
+    
+    return 0
+}
+
+# 释放文件锁
+#   原理: 删除锁标志文件。
+# 注意：应该在脚本退出前调用此函数释放锁，确保不会留下孤立的锁文件。
+release_lock() {
+    # 移除之前设置的信号处理
+    trap - EXIT INT TERM
+    rm -f "$LOCK_FILE" 2>/dev/null
+}
+
+# 检查必要依赖
+#   检查脚本运行所需的依赖命令是否存在，例如 curl、jq 等。
+check_dependencies() {
+    local missing_deps=()
+    
+    # 检查curl
+    if ! command -v curl >/dev/null 2>&1; then
+        missing_deps+=("curl")
+    fi
+    
+    # 检查jq
+    if ! command -v jq >/dev/null 2>&1; then
+        missing_deps+=("jq")
+    fi
+    
+    # 检查base64
+    if ! command -v base64 >/dev/null 2>&1; then
+        missing_deps+=("base64")
+    fi
+    
+    # 检查md5sum
+    if ! command -v md5sum >/dev/null 2>&1; then
+        missing_deps+=("md5sum")
+    fi
+    
+    # 检查sha256sum
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        missing_deps+=("sha256sum")
+    fi
+
+    # 检查stat
+    if ! command -v stat >/dev/null 2>&1; then
+        missing_deps+=("stat")
+    fi
+    
+    # 如果有缺失的依赖
+    if [ ${#missing_deps[@]} -gt 0 ]; then
+        echo "错误: 缺少必要的依赖命令: ${missing_deps[*]}"
+        echo "请安装缺失的命令后再运行此脚本。"
+        return 1
+    fi
+    
+    return 0
+}
+
+# 计算文件的 SHA256 哈希值
+# 重要提醒：
+#   方法中不能有其他 echo 输出，否则会干扰返回值的正确性。
+# 参数:
+#   $1 - 文件路径
+# 返回值:
+#   文件的 SHA256 哈希值，如果无法计算则返回空字符串
+calculate_file_hash() {
+    local file_path="$1"
+    
+    if [ ! -f "$file_path" ]; then
+        return 1
+    fi
+    
+    local hash_result
+    if ! hash_result=$(sha256sum "$file_path" 2>/dev/null | awk '{print $1}'); then
+        return 1
+    fi
+    
+    if [ -z "$hash_result" ]; then
+        return 1
+    fi
+    
+    echo "$hash_result"
+    return 0
 }
 
 # 写入缓存文件
+#   将文件路径、媒体 ID 和过期时间写入缓存文件中
+# 参数:
+#   $1 - 文件路径
+#   $2 - 媒体 ID
+#   $3 - 过期时间（秒）
 write_cache() {
     local file_path="$1"
-    local file_hash="$2"
-    local media_id="$3"
-    local expiry_time="$4"
+    local media_id="$2"
+    local expiry_time="$3"
+    
+    # 尝试获取锁
+    if ! acquire_lock; then
+        return 1
+    fi
+    
     local file_mtime=$(stat -c %Y "$file_path" 2>/dev/null || echo "0")
     local updated=false
     local temp_records=()
+    
+    # 计算文件哈希
+    local file_hash
+    if ! file_hash=$(calculate_file_hash "$file_path"); then
+        release_lock
+        return 1
+    fi
 
     # 读取现有缓存
     if [ -f "$CACHE_FILE" ]; then
@@ -76,19 +212,64 @@ write_cache() {
     
     # 写入缓存文件
     printf "%s\n" "${temp_records[@]}" > "$CACHE_FILE.tmp" 2>/dev/null
-    [ -f "$CACHE_FILE.tmp" ] && mv "$CACHE_FILE.tmp" "$CACHE_FILE" 2>/dev/null
+    if [ -f "$CACHE_FILE.tmp" ]; then
+        mv "$CACHE_FILE.tmp" "$CACHE_FILE" 2>/dev/null
+        # 设置安全权限
+        chmod 600 "$CACHE_FILE" 2>/dev/null
+    fi
+    
+    release_lock
 }
 
 # 检查文件是否已存在且未过期
+# 重要提醒：
+#   方法中不能有其他 echo 输出，否则会干扰返回值的正确性。
+# 参数:
+#   $1 - 文件路径
+# 返回值:
+#   0 - 文件存在且未过期，返回缓存的 media_id
+#   1 - 文件不存在或已过期
 check_cache() {
     local file_path="$1"
-    local file_hash="$2"
+    local cached_media_id=""
+    
+    # 尝试获取锁
+    if ! acquire_lock; then
+        return 1
+    fi
+    
+    # 使用子shell执行实际逻辑，确保即使发生错误也能释放锁
+    if cached_media_id=$(_check_cache_impl "$file_path"); then
+        release_lock
+        echo "$cached_media_id"
+        return 0
+    else
+        release_lock
+        return 1
+    fi
+}
+
+# 检查缓存的具体实现
+# 重要提醒：
+#   方法中不能有其他 echo 输出，否则会干扰返回值的正确性。
+# 参数:
+#   $1 - 文件路径
+# 返回值:
+#   缓存的 media_id，如果未找到则返回空字符串
+_check_cache_impl() {
+    local file_path="$1"
     local current_time=$(date +%s)
     local valid_records=()
     local cached_media_id=""
     
     # 获取文件的最后修改时间
     local file_mtime=$(stat -c %Y "$file_path" 2>/dev/null || echo "0")
+    
+    # 计算文件哈希
+    local file_hash
+    if ! file_hash=$(calculate_file_hash "$file_path"); then
+        return 1
+    fi
 
     if [ -f "$CACHE_FILE" ]; then
         # 先读取整个文件
@@ -111,8 +292,16 @@ check_cache() {
         done < "$CACHE_FILE"
 
         # 更新缓存文件
-        printf "%s\n" "${valid_records[@]}" > "$CACHE_FILE.tmp" 2>/dev/null
-        [ -f "$CACHE_FILE.tmp" ] && mv "$CACHE_FILE.tmp" "$CACHE_FILE" 2>/dev/null
+        if [ ${#valid_records[@]} -gt 0 ]; then
+            printf "%s\n" "${valid_records[@]}" > "$CACHE_FILE.tmp" 2>/dev/null
+            if [ -f "$CACHE_FILE.tmp" ]; then
+                mv "$CACHE_FILE.tmp" "$CACHE_FILE" 2>/dev/null
+                chmod 600 "$CACHE_FILE" 2>/dev/null
+            fi
+        else
+            # 如果所有记录都过期了，删除缓存文件
+            rm -f "$CACHE_FILE" 2>/dev/null
+        fi
 
         if [ -n "$cached_media_id" ]; then
             echo "$cached_media_id"
@@ -124,6 +313,11 @@ check_cache() {
 }
 
 # 发送文本消息函数
+# 参数:
+#   $1 - key
+#   $2 - 内容，必须是 UTF-8 编码的字符串
+#   $3 - 被提及用户列表（可选）
+#   $4 - 被提及用户的手机号列表（可选）
 send_text_message() {
     local key="$1"
     local content="$2"
@@ -165,7 +359,8 @@ send_text_message() {
 
 # 发送 Markdown 格式消息
 # 参数:
-#   $1 - 消息内容
+#   $1 - key
+#   $2 - 消息内容，必须是 UTF-8 编码的字符串
 send_markdown_message() {
     local key="$1"
     local content="$2"
@@ -256,6 +451,16 @@ send_news_message() {
 }
 
 # 上传文件，并返回 media_id
+# 重要提醒：
+#   - 文件大小不能超过 20MB，语音文件不超过 2MB 且格式为 AMR。
+#   - 语音文件播放长度不能超过 60 秒。
+#   - 方法中不能有其他 echo 输出，否则会干扰返回值的正确性。
+# 参数:
+#   $1 - key
+#   $2 - 文件路径
+#   $3 - 文件类型（file 或 voice）
+# 返回值:
+#   media_id 或错误信息
 upload_file() {
     local key="$1"
     local file_path="$2"
@@ -316,14 +521,9 @@ upload_file() {
             ;;
     esac
 
-    # 计算文件的 SHA256 哈希值
-    local file_hash=$(sha256sum "$file_path" | awk '{print $1}')
-
     # 检查缓存中是否已存在该文件且未过期
     local cached_media_id
-    if cached_media_id=$(check_cache "$file_hash"); then
-        # shell 需要使用 echo 输出返回值就是麻烦，不能有多余的 echos
-        #echo "文件已存在且未过期，使用缓存的 media_id: $cached_media_id"
+    if cached_media_id=$(check_cache "$file_path"); then
         echo "$cached_media_id"
         return 0
     fi
@@ -345,7 +545,7 @@ upload_file() {
         # 计算文件的过期时间（3 天后）
         local expiry_time=$(($(date +%s) + 3 * 24 * 60 * 60))
         # 写入缓存
-        write_cache "$file_hash" "$media_id" "$expiry_time"
+        write_cache "$file_path" "$media_id" "$expiry_time"
         echo "$media_id" # 返回 media_id
     fi
 }
@@ -499,6 +699,11 @@ main() {
     local key="$DEFAULT_KEY"
     local msgtype
 
+    # 检查依赖
+    if ! check_dependencies; then
+        exit 1
+    fi
+
     while getopts "k:" opt; do
         case $opt in
             k)
@@ -511,6 +716,12 @@ main() {
         esac
     done
     shift $((OPTIND - 1))
+
+    # 检查key是否有效
+    if [ -z "$key" ] || [ "$key" = "$DEFAULT_KEY" ]; then
+        echo "错误: 请提供有效的webhook key（使用-k参数或修改脚本中的DEFAULT_KEY）"
+        return 1
+    fi
 
     msgtype="$1"
     shift
