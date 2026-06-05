@@ -42,51 +42,64 @@
 #   7. 重构 check_cache 函数，避免潜在死锁风险
 
 DEFAULT_KEY="[replace by your default key]"
-CACHE_FILE=".media_cache"
+
+# 基于脚本所在目录解析缓存文件的绝对路径
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CACHE_FILE="${SCRIPT_DIR}/.media_cache"
 LOCK_FILE="/tmp/wechat_webhook_cache_$(id -u).lock"
 
+# 标记是否使用 flock
+USE_FLOCK=false
+if command -v flock >/dev/null 2>&1; then
+    USE_FLOCK=true
+fi
+
 # 获取文件锁
-#   原理: 使用一个临时文件作为锁标志，尝试创建该文件来获取锁，如果文件已存在则说明锁被占用。
+#   优先使用 flock（更可靠），回退到 noclobber 文件锁方案。
 acquire_lock() {
+    if [ "$USE_FLOCK" = true ]; then
+        exec 9>"$LOCK_FILE"
+        if ! flock -w 10 9; then
+            echo "警告: 无法获取文件锁，跳过缓存操作" >&2
+            return 1
+        fi
+        return 0
+    fi
+
+    # noclobber 回退方案
     local timeout=10
-    local lock_acquired=false
     local lock_pid
-    
+
     for ((i=0; i<timeout; i++)); do
         if ( set -o noclobber; echo "$$" > "$LOCK_FILE" ) 2>/dev/null; then
-            lock_acquired=true
-            # 设置信号处理，确保在脚本退出时清理锁文件
             trap 'rm -f "$LOCK_FILE" 2>/dev/null' EXIT INT TERM
-            break
+            return 0
         fi
-        
+
         # 检查锁是否被僵尸进程占用
         if [ -f "$LOCK_FILE" ]; then
             lock_pid=$(cat "$LOCK_FILE" 2>/dev/null)
             if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
-                # 进程不存在，清理僵尸锁
                 rm -f "$LOCK_FILE" 2>/dev/null
             fi
         fi
-        
+
         sleep 0.1
     done
-    
-    if [ "$lock_acquired" = false ]; then
-        echo "警告: 无法获取文件锁，跳过缓存操作" >&2
-        return 1
-    fi
-    
-    return 0
+
+    echo "警告: 无法获取文件锁，跳过缓存操作" >&2
+    return 1
 }
 
 # 释放文件锁
-#   原理: 删除锁标志文件。
-# 注意：应该在脚本退出前调用此函数释放锁，确保不会留下孤立的锁文件。
 release_lock() {
-    # 移除之前设置的信号处理
-    trap - EXIT INT TERM
-    rm -f "$LOCK_FILE" 2>/dev/null
+    if [ "$USE_FLOCK" = true ]; then
+        flock -u 9 2>/dev/null
+        exec 9>&-
+    else
+        trap - EXIT INT TERM
+        rm -f "$LOCK_FILE" 2>/dev/null
+    fi
 }
 
 # 检查必要依赖
@@ -192,9 +205,10 @@ write_cache() {
     if [ -f "$CACHE_FILE" ]; then
         while IFS= read -r line; do
             [ -z "$line" ] && continue
-            
-            cached_file_hash=$(echo "$line" | awk '{print $1}')
-            
+
+            local cached_file_hash
+            read -r cached_file_hash _ <<< "$line"
+
             # 如果找到相同文件哈希，更新记录
             if [ "$file_hash" == "$cached_file_hash" ]; then
                 temp_records+=("$file_hash $media_id $expiry_time $file_mtime")
@@ -275,11 +289,9 @@ _check_cache_impl() {
         # 先读取整个文件
         while IFS= read -r line; do
             [ -z "$line" ] && continue
-            
-            cached_file_hash=$(echo "$line" | awk '{print $1}')
-            cached_media_id_val=$(echo "$line" | awk '{print $2}')
-            cached_expiry_time=$(echo "$line" | awk '{print $3}')
-            cached_file_mtime=$(echo "$line" | awk '{print $4}')
+
+            local cached_file_hash cached_media_id_val cached_expiry_time cached_file_mtime
+            read -r cached_file_hash cached_media_id_val cached_expiry_time cached_file_mtime <<< "$line"
 
             if [ "$current_time" -lt "$cached_expiry_time" ]; then
                 # 检查是否匹配当前文件
@@ -330,27 +342,18 @@ send_text_message() {
         return 1
     fi
 
-    # 对消息内容进行 UTF-8 编码处理
-    local utf8_content=$(echo -n "$content" | iconv -f utf-8 -t utf-8)
-
-    # 构建 JSON 数据结构
-    local json_data='{
-        "msgtype": "text",
-        "text": {
-            "content": "'"$utf8_content"'"
-        }
-    }'
+    # 使用 jq 安全构建 JSON，避免注入风险
+    local json_data
+    json_data=$(jq -n --arg content "$content" '{msgtype: "text", text: {content: $content}}')
 
     # 如果提供了提及用户列表，则转换为 JSON 数组并添加到 JSON 数据中
     if [ -n "$mentioned_list" ]; then
-        local mentioned_list_array=$(echo "$mentioned_list" | jq -R 'split(",")')
-        json_data=$(echo "$json_data" | jq --argjson mentioned_list "$mentioned_list_array" '.text += {"mentioned_list": $mentioned_list}')
+        json_data=$(echo "$json_data" | jq --arg list "$mentioned_list" '.text.mentioned_list = ($list | split(","))')
     fi
 
     # 如果提供了提及用户手机号列表，则转换为 JSON 数组并添加到 JSON 数据中
     if [ -n "$mentioned_mobile_list" ]; then
-        local mentioned_mobile_list_array=$(echo "$mentioned_mobile_list" | jq -R 'split(",")')
-        json_data=$(echo "$json_data" | jq --argjson mentioned_mobile_list "$mentioned_mobile_list_array" '.text += {"mentioned_mobile_list": $mentioned_mobile_list}')
+        json_data=$(echo "$json_data" | jq --arg list "$mentioned_mobile_list" '.text.mentioned_mobile_list = ($list | split(","))')
     fi
 
     # 发送请求
@@ -371,16 +374,9 @@ send_markdown_message() {
         return 1
     fi
 
-    # 对消息内容进行 UTF-8 编码处理
-    local utf8_content=$(echo -n "$content" | iconv -f utf-8 -t utf-8)
-
-    # 构建 JSON 数据结构
-    local json_data='{
-        "msgtype": "markdown",
-        "markdown": {
-            "content": "'"$utf8_content"'"
-        }
-    }'
+    # 使用 jq 安全构建 JSON，避免注入风险
+    local json_data
+    json_data=$(jq -n --arg content "$content" '{msgtype: "markdown", markdown: {content: $content}}')
 
     # 发送请求
     send_request "$key" "$json_data"
@@ -411,40 +407,29 @@ send_news_message() {
     IFS=',' read -r -a url_array <<< "$urls"
     IFS=',' read -r -a picurl_array <<< "$picurls"
 
-    # 构建 articles JSON 数据
-    local articles_json='['
+    # 使用 jq 安全构建 articles JSON 数据
+    local articles_json='[]'
     for i in "${!title_array[@]}"; do
         if [ $i -ge 8 ]; then
             break
         fi
 
-        local article_json='{
-            "title": "'"${title_array[$i]}"'",
-            "url": "'"${url_array[$i]}"'"
-        }'
+        local article_json
+        article_json=$(jq -n \
+            --arg title "${title_array[$i]}" \
+            --arg url "${url_array[$i]}" \
+            --arg desc "${description_array[$i]}" \
+            --arg pic "${picurl_array[$i]}" \
+            '{title: $title, url: $url} +
+             (if $desc != "" then {description: $desc} else {} end) +
+             (if $pic != "" then {picurl: $pic} else {} end)')
 
-        if [ -n "${description_array[$i]}" ]; then
-            article_json=$(echo "$article_json" | jq '. += {"description": "'"${description_array[$i]}"'"}')
-        fi
-
-        if [ -n "${picurl_array[$i]}" ]; then
-            article_json=$(echo "$article_json" | jq '. += {"picurl": "'"${picurl_array[$i]}"'"}')
-        fi
-
-        articles_json+="$article_json"
-        if [ $i -lt $((${#title_array[@]}-1)) ]; then
-            articles_json+=','
-        fi
+        articles_json=$(echo "$articles_json" | jq --argjson article "$article_json" '. + [$article]')
     done
-    articles_json+=']'
 
-    # 构建最终的 JSON 数据结构
-    local json_data='{
-        "msgtype": "news",
-        "news": {
-        "articles": '"$articles_json"'
-        }
-    }'
+    # 使用 jq 构建最终的 JSON 数据结构
+    local json_data
+    json_data=$(echo "$articles_json" | jq '{msgtype: "news", news: {articles: .}}')
 
     # 发送请求
     send_request "$key" "$json_data"
@@ -570,13 +555,9 @@ send_file_message() {
         return 1
     fi
 
-    # 构建 JSON 数据结构
-    local json_data='{
-        "msgtype": "file",
-        "file": {
-            "media_id": "'"$media_id"'"
-        }
-    }'
+    # 使用 jq 安全构建 JSON
+    local json_data
+    json_data=$(jq -n --arg media_id "$media_id" '{msgtype: "file", file: {media_id: $media_id}}')
 
     # 发送请求
     send_request "$key" "$json_data"
@@ -602,13 +583,9 @@ send_voice_message() {
         return 1
     fi
 
-    # 构建 JSON 数据结构
-    local json_data='{
-        "msgtype": "voice",
-        "voice": {
-            "media_id": "'"$media_id"'"
-        }
-    }'
+    # 使用 jq 安全构建 JSON
+    local json_data
+    json_data=$(jq -n --arg media_id "$media_id" '{msgtype: "voice", voice: {media_id: $media_id}}')
 
     # 发送请求
     send_request "$key" "$json_data"
@@ -655,14 +632,10 @@ send_image_message() {
         local md5_value=$(echo -n "$decoded_data" | md5sum | awk '{print $1}')
     fi
 
-    # 构建 JSON 数据结构
-    local json_data='{
-        "msgtype": "image",
-        "image": {
-            "base64": "'"$base64_data"'",
-            "md5": "'"$md5_value"'"
-        }
-    }'
+    # 使用 jq 安全构建 JSON
+    local json_data
+    json_data=$(jq -n --arg base64 "$base64_data" --arg md5 "$md5_value" \
+        '{msgtype: "image", image: {base64: $base64, md5: $md5}}')
 
     # 发送请求
     send_request "$key" "$json_data"
@@ -685,8 +658,10 @@ send_request() {
     local errcode=$(echo "$response" | jq -r '.errcode')
     if [ "$errcode" == "0" ]; then
         echo "消息发送成功: $response"
+        return 0
     else
         echo "消息发送失败: $response"
+        return 1
     fi
 }
 
@@ -754,3 +729,4 @@ main() {
 
 # 调用主函数
 main "$@"
+

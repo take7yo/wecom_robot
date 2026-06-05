@@ -187,7 +187,7 @@ validate_message_type() {
 
 # 定义函数，根据消息类型调用 send_message.sh
 # 功能: 调用底层的 send_message.sh 脚本发送消息
-# 参数: 
+# 参数:
 #   $1 - Webhook key
 #   $2 - 消息类型
 #   $3... - 消息的具体参数
@@ -196,35 +196,105 @@ send_message() {
     local KEY="$1"
     local MESSAGE_TYPE="$2"
     shift 2
-    
+
     if [ -n "$KEY" ]; then
         echo "发送 $MESSAGE_TYPE 消息到 key: ${KEY:0:8}..." >&2
     else
         echo "发送 $MESSAGE_TYPE 消息到默认配置..." >&2
     fi
-    
-    # 简洁的参数构建方式
-    local KEY_OPTION=""
+
+    # 使用数组构建参数，避免 word splitting
+    local cmd=(./send_message.sh)
     if [ -n "$KEY" ]; then
-        KEY_OPTION="-k $KEY"
+        cmd+=(-k "$KEY")
     fi
-    
-    ./send_message.sh $KEY_OPTION "$MESSAGE_TYPE" "$@"
-    
+    cmd+=("$MESSAGE_TYPE" "$@")
+
+    "${cmd[@]}"
+
     local EXIT_CODE=$?
     if [ $EXIT_CODE -eq 0 ]; then
         echo "完成" >&2
     else
         echo "失败 (退出码: $EXIT_CODE)" >&2
     fi
-    
+
     echo "" >&2
     return $EXIT_CODE
 }
 
+# 公共的消息分发和统计函数
+# 功能: 向一组有效的 key 发送消息，并输出统计结果
+# 参数:
+#   $1 - 消息类型
+#   $2... - 消息的具体参数
+# 环境变量（调用方需提前设置）:
+#   VALID_KEYS    - 有效 key 数组
+#   TOTAL_KEYS    - 总 key 数量
+#   MISSING_KEYS  - 缺失 key 数组
+#   MISSING_FATAL - 缺失 key 是否致命（true/false）
+#   KEYS_JSON     - keys.json 内容（用于错误提示）
+# 返回值: 无，所有处理结果会输出到控制台
+dispatch_messages() {
+    local MESSAGE_TYPE="$1"
+    shift
+
+    local PROCESSED_KEYS=0
+    local SUCCESS_COUNT=0
+    local FAIL_COUNT=0
+
+    # 处理缺失 key 的情况
+    if [ ${#MISSING_KEYS[@]} -ne 0 ]; then
+        if [ "$MISSING_FATAL" = true ]; then
+            echo "错误: 以下标识符不存在或配置错误: ${MISSING_KEYS[*]}" >&2
+            echo "" >&2
+            echo "可用的标识符:" >&2
+            echo "$KEYS_JSON" | jq -r 'keys | join(", ")' >&2
+            exit 1
+        else
+            echo "警告: 以下标识符配置有问题: ${MISSING_KEYS[*]}" >&2
+            echo "" >&2
+        fi
+    fi
+
+    if [ ${#VALID_KEYS[@]} -eq 0 ]; then
+        echo "没有找到有效的 key 配置，将使用默认配置" >&2
+        echo "" >&2
+        echo "[1/1] 发送到默认配置:" >&2
+        if send_message "" "$MESSAGE_TYPE" "$@"; then
+            SUCCESS_COUNT=1
+        else
+            FAIL_COUNT=1
+        fi
+    else
+        echo "找到 ${#VALID_KEYS[@]}/$TOTAL_KEYS 个有效配置" >&2
+        echo "" >&2
+        for key in "${VALID_KEYS[@]}"; do
+            PROCESSED_KEYS=$((PROCESSED_KEYS + 1))
+            echo "[$PROCESSED_KEYS/${#VALID_KEYS[@]}] " >&2
+            if send_message "$key" "$MESSAGE_TYPE" "$@"; then
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            else
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+            fi
+        done
+    fi
+
+    echo "========================================" >&2
+    echo "发送结果统计:" >&2
+    echo "  成功: $SUCCESS_COUNT" >&2
+    echo "  失败: $FAIL_COUNT" >&2
+    if [ ${#VALID_KEYS[@]} -eq 0 ]; then
+        echo "  总计: 1 (默认配置)" >&2
+    else
+        echo "  总计: ${#VALID_KEYS[@]}" >&2
+    fi
+    echo "========================================" >&2
+}
+
 # 处理所有 keys 的情况
 # 功能: 处理 --all 参数，向所有配置的 keys 发送消息
-# 参数: 
+# 参数:
 #   $1 - keys.json 内容
 #   $2 - 消息类型
 #   $3... - 消息的具体参数
@@ -233,7 +303,7 @@ process_all_keys() {
     local KEYS_JSON="$1"
     local MESSAGE_TYPE="$2"
     shift 2
-    
+
     # 获取所有 key 标识符
     local KEYS
     if ! KEYS=$(echo "$KEYS_JSON" | jq -r 'keys[]' 2>/dev/null); then
@@ -241,17 +311,14 @@ process_all_keys() {
         echo "请检查文件格式是否为有效的 JSON" >&2
         exit 1
     fi
-    
+
     local MISSING_KEYS=()
     local VALID_KEYS=()
     local TOTAL_KEYS=0
-    local PROCESSED_KEYS=0
-    local SUCCESS_COUNT=0
-    local FAIL_COUNT=0
-    
+
     echo "开始处理所有配置的 keys..." >&2
     echo "" >&2
-    
+
     for key in $KEYS; do
         TOTAL_KEYS=$((TOTAL_KEYS + 1))
         local VALUE
@@ -263,55 +330,14 @@ process_all_keys() {
             VALID_KEYS+=("$VALUE")
         fi
     done
-    
-    # 如果存在缺失的 key，输出错误信息
-    if [ ${#MISSING_KEYS[@]} -ne 0 ]; then
-        echo "警告: 以下标识符配置有问题: ${MISSING_KEYS[*]}" >&2
-        echo "" >&2
-    fi
-    
-    if [ ${#VALID_KEYS[@]} -eq 0 ]; then
-        echo "没有找到有效的 key 配置，将使用默认配置" >&2
-        echo "" >&2
-        
-        # 使用默认配置发送消息
-        echo "[1/1] 发送到默认配置:" >&2
-        if send_message "" "$MESSAGE_TYPE" "$@"; then
-            SUCCESS_COUNT=1
-        else
-            FAIL_COUNT=1
-        fi
-    else
-        echo "找到 ${#VALID_KEYS[@]}/$TOTAL_KEYS 个有效配置" >&2
-        echo "" >&2
-        
-        # 发送消息到所有有效的 keys
-        for key in "${VALID_KEYS[@]}"; do
-            PROCESSED_KEYS=$((PROCESSED_KEYS + 1))
-            echo "[$PROCESSED_KEYS/${#VALID_KEYS[@]}] " >&2
-            if send_message "$key" "$MESSAGE_TYPE" "$@"; then
-                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-            else
-                FAIL_COUNT=$((FAIL_COUNT + 1))
-            fi
-        done
-    fi
-    
-    echo "========================================" >&2
-    echo "发送结果统计:" >&2
-    echo "  成功: $SUCCESS_COUNT" >&2
-    echo "  失败: $FAIL_COUNT" >&2
-    if [ ${#VALID_KEYS[@]} -eq 0 ]; then
-        echo "  总计: 1 (默认配置)" >&2
-    else
-        echo "  总计: ${#VALID_KEYS[@]}" >&2
-    fi
-    echo "========================================" >&2
+
+    MISSING_FATAL=false
+    KEYS_JSON="$KEYS_JSON" dispatch_messages "$MESSAGE_TYPE" "$@"
 }
 
 # 处理指定的多个 keys 的情况
 # 功能: 处理指定的多个 key 标识符，向这些 key 发送消息
-# 参数: 
+# 参数:
 #   $1 - keys.json 内容
 #   $2 - 要发送的 key 标识符（逗号分隔）
 #   $3 - 消息类型
@@ -322,26 +348,23 @@ process_multiple_keys() {
     local KEY_IDENTIFIER="$2"
     local MESSAGE_TYPE="$3"
     shift 3
-    
+
     IFS=',' read -r -a KEY_ARRAY <<< "$KEY_IDENTIFIER"
     local MISSING_KEYS=()
     local VALID_KEYS=()
     local TOTAL_KEYS=${#KEY_ARRAY[@]}
-    local PROCESSED_KEYS=0
-    local SUCCESS_COUNT=0
-    local FAIL_COUNT=0
-    
+
     echo "开始处理指定 keys: $KEY_IDENTIFIER" >&2
     echo "" >&2
-    
+
     for key in "${KEY_ARRAY[@]}"; do
         # 去除可能的空格
         key=$(echo "$key" | xargs)
-        
+
         if [ -z "$key" ]; then
             continue
         fi
-        
+
         local VALUE
         if ! VALUE=$(check_key_exists "$KEYS_JSON" "$key"); then
             MISSING_KEYS+=("$key")
@@ -351,53 +374,9 @@ process_multiple_keys() {
             VALID_KEYS+=("$VALUE")
         fi
     done
-    
-    # 如果存在缺失的 key，输出错误信息
-    if [ ${#MISSING_KEYS[@]} -ne 0 ]; then
-        echo "错误: 以下标识符不存在或配置错误: ${MISSING_KEYS[*]}" >&2
-        echo "" >&2
-        echo "可用的标识符:" >&2
-        echo "$KEYS_JSON" | jq -r 'keys | join(", ")' >&2
-        exit 1
-    fi
-    
-    if [ ${#VALID_KEYS[@]} -eq 0 ]; then
-        echo "没有找到有效的 key 配置，将使用默认配置" >&2
-        echo "" >&2
-        
-        # 使用默认配置发送消息
-        echo "[1/1] 发送到默认配置:" >&2
-        if send_message "" "$MESSAGE_TYPE" "$@"; then
-            SUCCESS_COUNT=1
-        else
-            FAIL_COUNT=1
-        fi
-    else
-        echo "找到 ${#VALID_KEYS[@]}/$TOTAL_KEYS 个有效配置" >&2
-        echo "" >&2
-        
-        # 发送消息到所有有效的 keys
-        for key in "${VALID_KEYS[@]}"; do
-            PROCESSED_KEYS=$((PROCESSED_KEYS + 1))
-            echo "[$PROCESSED_KEYS/${#VALID_KEYS[@]}] " >&2
-            if send_message "$key" "$MESSAGE_TYPE" "$@"; then
-                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-            else
-                FAIL_COUNT=$((FAIL_COUNT + 1))
-            fi
-        done
-    fi
-    
-    echo "========================================" >&2
-    echo "发送结果统计:" >&2
-    echo "  成功: $SUCCESS_COUNT" >&2
-    echo "  失败: $FAIL_COUNT" >&2
-    if [ ${#VALID_KEYS[@]} -eq 0 ]; then
-        echo "  总计: 1 (默认配置)" >&2
-    else
-        echo "  总计: ${#VALID_KEYS[@]}" >&2
-    fi
-    echo "========================================" >&2
+
+    MISSING_FATAL=true
+    KEYS_JSON="$KEYS_JSON" dispatch_messages "$MESSAGE_TYPE" "$@"
 }
 
 # 主逻辑
@@ -435,3 +414,4 @@ main() {
 
 # 脚本入口点
 main "$@"
+
