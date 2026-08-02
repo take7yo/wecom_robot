@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 
 # Shell 脚本用于发送不同类型的消息到企业微信的 Webhook 接口
-# 支持发送文本消息、Markdown 格式消息、新闻格式消息、文件消息、语音消息和图片消息
+# 支持发送文本消息、Markdown 格式消息、Markdown V2 格式消息（支持表格）、
+# 新闻格式消息、文件消息、语音消息、图片消息和模板卡片消息
 #
 # 使用说明：
 # 1. 保存脚本为 send_message.sh
@@ -12,6 +13,8 @@
 #     ./send_message.sh -k "YOUR_WEBHOOK_KEY" text "大家好，我是机器人，现在在测试" "user1,user2" "13800000000,13900000000"
 #   - 发送 Markdown 格式消息：
 #     ./send_message.sh -k "YOUR_WEBHOOK_KEY" markdown "实时新增用户反馈<font color=\"warning\">132例</font>，请相关同事注意。\n>类型:<font color=\"comment\">用户反馈</font>\n>普通用户反馈:<font color=\"comment\">117例</font>\n>VIP 用户反馈:<font color=\"comment\">15例</font>"
+#   - 发送 Markdown V2 格式消息（支持表格渲染）：
+#     ./send_message.sh -k "YOUR_WEBHOOK_KEY" markdown_v2 "| 姓名 | 尺寸 |\n| :--- | :--: |\n| 张三 |  L  |\n| 李四 |  XL |"
 #   - 发送新闻格式消息：
 #     ./send_message.sh -k "YOUR_WEBHOOK_KEY" news "中秋节礼品领取, 端午节礼品领取" "今年中秋节公司有豪礼相送, 今年端午节公司有豪礼相送" "http://www.qq.com, http://www.baidu.com" "http://res.mail.qq.com/node/ww/wwopenmng/images/independent/doc/test_pic_msg1.png, http://res.mail.qq.com/node/ww/wwopenmng/images/independent/doc/test_pic_msg2.png"
 #     如果没有描述或图片 URL，可以省略：
@@ -24,6 +27,8 @@
 #     ./send_message.sh -k "YOUR_WEBHOOK_KEY" image "/path/to/image.jpg"
 #     或者
 #     ./send_message.sh -k "YOUR_WEBHOOK_KEY" image "BASE64_STRING"
+#   - 发送模板卡片消息：
+#     ./send_message.sh -k "YOUR_WEBHOOK_KEY" template_card '{"card_type":"text_notice","main_title":{"title":"今日日报","desc":"2026-08-02"},"card_action":{"type":1,"url":"https://example.com"}}'
 #
 # 作者: Ivan Zhang
 # 日期: 2024/07/26
@@ -40,6 +45,10 @@
 #   5. 优化锁管理，确保异常情况下的锁清理
 #   6. 清理代码，删除未使用的 read_cache 函数
 #   7. 重构 check_cache 函数，避免潜在死锁风险
+# 2026/08/02
+#   1. 新增 markdown_v2 消息类型支持，用于渲染表格
+#   2. 新增 template_card 消息类型支持，用于发送模板卡片
+#   3. 更新使用说明和 main 函数分支
 
 DEFAULT_KEY="[replace by your default key]"
 
@@ -382,6 +391,27 @@ send_markdown_message() {
     send_request "$key" "$json_data"
 }
 
+# ===== 新增：发送 Markdown V2 格式消息（支持表格渲染） =====
+# 注意：markdown_v2 不支持 @群成员的扩展语法，如需 @ 人请改用 text 或 markdown
+# 参数:
+#   $1 - key
+#   $2 - 消息内容，必须是 UTF-8 编码的字符串
+send_markdown_v2_message() {
+    local key="$1"
+    local content="$2"
+
+    if [ -z "$content" ]; then
+        echo "Usage: send_markdown_v2_message <key> <content>"
+        return 1
+    fi
+
+    # 使用 jq 安全构建 JSON
+    local json_data
+    json_data=$(jq -n --arg content "$content" '{msgtype: "markdown_v2", markdown_v2: {content: $content}}')
+
+    send_request "$key" "$json_data"
+}
+
 # 发送新闻格式消息
 # 参数:
 #   $1 - 标题列表（逗号分隔）
@@ -641,6 +671,33 @@ send_image_message() {
     send_request "$key" "$json_data"
 }
 
+# ===== 新增：发送模板卡片消息 =====
+# 参数:
+#   $1 - key
+#   $2 - 模板卡片 JSON 字符串（符合官方 template_card 格式）
+send_template_card_message() {
+    local key="$1"
+    local card_json="$2"
+
+    if [ -z "$card_json" ]; then
+        echo "Usage: send_template_card_message <key> <card_json>"
+        return 1
+    fi
+
+    # 校验 JSON 合法性（利用 jq 的错误输出）
+    if ! echo "$card_json" | jq . >/dev/null 2>&1; then
+        echo "错误: 提供的模板卡片参数不是合法的 JSON 字符串。"
+        return 1
+    fi
+
+    # 使用 jq 安全构建，--argjson 将 card_json 作为 JSON 对象嵌入
+    local json_data
+    json_data=$(jq -n --argjson card "$card_json" \
+        '{msgtype: "template_card", template_card: $card}')
+
+    send_request "$key" "$json_data"
+}
+
 # 发送 HTTP 请求函数
 # 参数:
 #   $1 - 群接口 key
@@ -668,7 +725,7 @@ send_request() {
 # 主函数，根据传递的参数调用不同的函数
 # 参数:
 #   -k key - 群接口 key
-#   $1 - 消息类型 (text, markdown, news, file, voice, image)
+#   $1 - 消息类型 (text, markdown, markdown_v2, news, file, voice, image, template_card)
 #   $@ - 剩余的参数根据消息类型的不同而不同
 main() {
     local key="$DEFAULT_KEY"
@@ -685,7 +742,7 @@ main() {
                 key="$OPTARG"
                 ;;
             *)
-                echo "Usage: $0 [-k key] {text|markdown|news|file|voice|image} [arguments...]"
+                echo "Usage: $0 [-k key] {text|markdown|markdown_v2|news|file|voice|image|template_card} [arguments...]"
                 return 1
                 ;;
         esac
@@ -708,6 +765,9 @@ main() {
         markdown)
             send_markdown_message "$key" "$@"
             ;;
+        markdown_v2)
+            send_markdown_v2_message "$key" "$@"
+            ;;
         news)
             send_news_message "$key" "$@"
             ;;
@@ -720,8 +780,11 @@ main() {
         image)
             send_image_message "$key" "$@"
             ;;
+        template_card)
+            send_template_card_message "$key" "$@"
+            ;;
         *)
-            echo "Usage: $0 [-k key] {text|markdown|news|file|voice|image} [arguments...]"
+            echo "Usage: $0 [-k key] {text|markdown|markdown_v2|news|file|voice|image|template_card} [arguments...]"
             return 1
             ;;
     esac
@@ -729,4 +792,3 @@ main() {
 
 # 调用主函数
 main "$@"
-
