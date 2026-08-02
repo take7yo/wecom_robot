@@ -2,7 +2,7 @@
 
 根据企业微信官网机器人 api 封装的 bash 实现。
 
-此脚本现在支持发送文本消息、Markdown 格式消息、新闻格式消息、文件消息、语音消息和图片消息。
+此脚本现在支持发送文本消息、Markdown 格式消息、Markdown V2 格式消息（支持表格渲染）、新闻格式消息、文件消息、语音消息、图片消息和模板卡片消息。
 
 每种消息类型都封装在单独的函数中，并对内容进行了 UTF-8 编码处理。
 
@@ -19,7 +19,12 @@
 - 发送 Markdown 格式消息：
   ```shell
   ./send_message.sh -k "YOUR_WEBHOOK_KEY" markdown "实时新增用户反馈<font color=\"warning\">132例</font>，请相关同事注意。\n>类型:<font color=\"comment\">用户反馈</font>\n>普通用户反馈:<font color=\"comment\">117例</font>\n>VIP 用户反馈:<font color=\"comment\">15例</font>"
+
+- 发送 Markdown V2 格式消息（支持表格渲染）：
+  ```shell
+  ./send_message.sh -k "YOUR_WEBHOOK_KEY" markdown_v2 "| 姓名 | 尺寸 |\n| :--- | :--: |\n| 张三 |  L  |\n| 李四 |  XL |"
   ```
+  > 注意：markdown_v2 不支持 @群成员扩展语法，如需 @ 人请改用 text 或 markdown。
 
 - 发送新闻格式消息：
   ```shell
@@ -48,6 +53,12 @@
   ```shell
   ./send_message.sh -k "YOUR_WEBHOOK_KEY" image "BASE64_STRING"
   ```
+
+- 发送模板卡片消息：
+  ```shell
+  ./send_message.sh -k "YOUR_WEBHOOK_KEY" template_card '{"card_type":"text_notice","main_title":{"title":"今日日报","desc":"2026-08-02"},"card_action":{"type":1,"url":"https://example.com"}}'
+  ```
+
 请将 `YOUR_WEBHOOK_KEY` 替换为企业微信 Webhook 接口的实际 key，`/path/to/` 替换为实际的文件路径或 Base64 字符串内容。
 如果你有常用的机器人，`-k "YOUR_WEBHOOK_KEY"` 可以通过修改脚本的默认 key 省略掉。
 
@@ -98,3 +109,4 @@
      ./wecom_robot.sh nonexistent_key text "大家好，我是机器人，现在在测试" "user1,user2" "13800000000,13900000000"
      ```
      这样，当指定的 key 不存在时，脚本会输出中文提示信息，并使用默认的 `YOUR_WEBHOOK_KEY`。
+
